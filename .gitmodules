@@ -4,3 +4,6 @@
 [submodule "ML_Models"]
 	path = ML_Models
 	url = https://github.com/SujithSaiSripadam/MLModels.git
+[submodule "NeuralNetworks"]
+	path = NeuralNetworks
+	url = https://github.com/SujithSaiSripadam/NN.git
