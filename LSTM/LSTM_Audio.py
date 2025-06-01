@@ -14,6 +14,9 @@ import pandas as pd
 import optuna
 import sys
 import signal
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 results = {}
 best_mse_global = float('inf')
@@ -63,14 +66,23 @@ def save_intermediate(trial_num, mae, preds, trues, trial_params, task_name, plo
         f.write(f"Best RMSE_Global: {best_mse_global:.4f}\n")
         f.write(f"Params: {trial_params}\n" + '-' * 40 + '\n')
 
-def build_audio_model(audio_shape, lstm_units, dropout_rate):
-    audio_input = Input(shape=audio_shape)
-    audio_lstm = LSTM(lstm_units, activation='tanh')(audio_input)
-    dropout = Dropout(dropout_rate)(audio_lstm)
-    output = Dense(1)(dropout)
-    return Model(inputs=audio_input, outputs=output)
+def build_audio_model(input_dim, lstm_units, dropout_rate):
+    class AudioLSTM(nn.Module):
+        def __init__(self, input_dim, lstm_units, dropout_rate):
+            super().__init__()
+            self.lstm = nn.LSTM(input_dim, lstm_units, batch_first=True)
+            self.dropout = nn.Dropout(dropout_rate)
+            self.fc = nn.Linear(lstm_units, 1)
+        def forward(self, x):
+            out, _ = self.lstm(x)
+            out = out[:, -1, :]
+            out = self.dropout(out)
+            out = self.fc(out)
+            return out
+    return AudioLSTM(input_dim, lstm_units, dropout_rate)
 
 def objective(trial, task_name, audio_data, labels, plot_dir, model_dir):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     max_audio_length = max(len(seq) for seq in audio_data)
     audio_data = pad_sequence(audio_data, max_audio_length)
     audio_scaler = StandardScaler()
@@ -82,13 +94,15 @@ def objective(trial, task_name, audio_data, labels, plot_dir, model_dir):
     lstm_units = trial.suggest_int('lstm_units', 32, 128)
     dropout_rate = trial.suggest_float('dropout', 0.1, 0.5)
     learning_rate = trial.suggest_float('lr', 1e-5, 1e-3, log=True)
+    optimizer_name = trial.suggest_categorical('optimizer', ['adam', 'adamw', 'sgd', 'rmsprop'])
+    num_epochs = 20
+    batch_size = 16
     for test_index in range(n_subjects):
-        print(f"subj : {n_subjects}")
         X_test_audio = audio_data[test_index:test_index+1]
         y_test = labels[test_index:test_index+1]
         train_val_ids = [i for i in range(n_subjects) if i != test_index]
         best_mae_val = float('inf')
-        best_weights = None
+        best_state = None
         best_train_losses = []
         best_val_losses = []
         for val_index in train_val_ids:
@@ -99,33 +113,75 @@ def objective(trial, task_name, audio_data, labels, plot_dir, model_dir):
             y_val = labels[val_index:val_index+1]
             audio_scaler.fit(X_train_audio.reshape(-1, X_train_audio.shape[-1]))
             label_scaler.fit(y_train.reshape(-1, 1))
-            X_train_audio = audio_scaler.transform(X_train_audio.reshape(-1, X_train_audio.shape[-1])).reshape(X_train_audio.shape)
-            X_val_audio = audio_scaler.transform(X_val_audio.reshape(-1, X_val_audio.shape[-1])).reshape(X_val_audio.shape)
+            X_train_audio_scaled = audio_scaler.transform(X_train_audio.reshape(-1, X_train_audio.shape[-1])).reshape(X_train_audio.shape)
+            X_val_audio_scaled = audio_scaler.transform(X_val_audio.reshape(-1, X_val_audio.shape[-1])).reshape(X_val_audio.shape)
             y_train_scaled = label_scaler.transform(y_train.reshape(-1, 1))
             y_val_scaled = label_scaler.transform(y_val.reshape(-1, 1))
-            model = build_audio_model((X_train_audio.shape[1], X_train_audio.shape[2]), lstm_units, dropout_rate)
-            model.compile(optimizer=Adam(learning_rate), loss='mse')
-            early_stop = EarlyStopping(patience=3, restore_best_weights=True)
-            history = model.fit(X_train_audio, y_train_scaled, epochs=20, batch_size=16, verbose=0,
-                      validation_data=(X_val_audio, y_val_scaled), callbacks=[early_stop])
-            y_val_pred_scaled = model.predict(X_val_audio)
-            y_val_pred = label_scaler.inverse_transform(y_val_pred_scaled)
-            mae_val = mean_absolute_error(y_val, y_val_pred)
-            if mae_val < best_mae_val:
-                best_mae_val = mae_val
-                best_weights = model.get_weights()
-                best_train_losses = history.history['loss'] if 'loss' in history.history else []
-                best_val_losses = history.history['val_loss'] if 'val_loss' in history.history else []
-        if best_weights is not None:
-            model = build_audio_model((X_test_audio.shape[1], X_test_audio.shape[2]), lstm_units, dropout_rate)
-            model.set_weights(best_weights)
-            X_test_audio = audio_scaler.transform(X_test_audio.reshape(-1, X_test_audio.shape[-1])).reshape(X_test_audio.shape)
-            y_test_pred_scaled = model.predict(X_test_audio)
+            X_train_tensor = torch.tensor(X_train_audio_scaled, dtype=torch.float32).to(device)
+            X_val_tensor = torch.tensor(X_val_audio_scaled, dtype=torch.float32).to(device)
+            y_train_tensor = torch.tensor(y_train_scaled, dtype=torch.float32).to(device)
+            y_val_tensor = torch.tensor(y_val_scaled, dtype=torch.float32).to(device)
+            model = build_audio_model(X_train_tensor.shape[2], lstm_units, dropout_rate).to(device)
+            if optimizer_name == 'adam':
+                optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+            elif optimizer_name == 'adamw':
+                optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+            elif optimizer_name == 'sgd':
+                optimizer = optim.SGD(model.parameters(), lr=learning_rate)
+            elif optimizer_name == 'rmsprop':
+                optimizer = optim.RMSprop(model.parameters(), lr=learning_rate)
+            criterion = nn.SmoothL1Loss()
+            train_losses = []
+            val_losses = []
+            best_val = float('inf')
+            patience = 3
+            patience_counter = 0
+            for epoch in range(num_epochs):
+                model.train()
+                optimizer.zero_grad()
+                output = model(X_train_tensor)
+                loss = criterion(output, y_train_tensor)
+                loss.backward()
+                optimizer.step()
+                train_losses.append(loss.item())
+                model.eval()
+                with torch.no_grad():
+                    val_output = model(X_val_tensor)
+                    val_loss = criterion(val_output, y_val_tensor)
+                    val_losses.append(val_loss.item())
+                    val_pred = label_scaler.inverse_transform(val_output.cpu().numpy())
+                    val_true = label_scaler.inverse_transform(y_val_tensor.cpu().numpy())
+                    mae_val = mean_absolute_error(val_true, val_pred)
+                if mae_val < best_val:
+                    best_val = mae_val
+                    best_state = model.state_dict()
+                    best_train_losses = train_losses.copy()
+                    best_val_losses = val_losses.copy()
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                if patience_counter >= patience:
+                    break
+            if best_val < best_mae_val:
+                best_mae_val = best_val
+                best_weights = best_state
+                best_train_losses_final = best_train_losses
+                best_val_losses_final = best_val_losses
+        if best_mae_val < float('inf'):
+            model = build_audio_model(X_test_audio.shape[2], lstm_units, dropout_rate).to(device)
+            model.load_state_dict(best_weights)
+            model.eval()
+            X_test_audio_scaled = audio_scaler.transform(X_test_audio.reshape(-1, X_test_audio.shape[-1])).reshape(X_test_audio.shape)
+            X_test_tensor = torch.tensor(X_test_audio_scaled, dtype=torch.float32).to(device)
+            with torch.no_grad():
+                y_test_pred_scaled = model(X_test_tensor).cpu().numpy()
             y_test_pred = label_scaler.inverse_transform(y_test_pred_scaled)
             y_true_all.append(y_test[0])
             y_pred_all.append(y_test_pred.ravel()[0])
-            all_train_losses[test_index] = best_train_losses
-            all_val_losses[test_index] = best_val_losses
+            all_train_losses[test_index] = best_train_losses_final
+            all_val_losses[test_index] = best_val_losses_final
+            # Save best model checkpoint for this subject
+            torch.save(best_weights, os.path.join(model_dir, f'model_subject_{test_index}.pt'))
         else:
             all_train_losses[test_index] = []
             all_val_losses[test_index] = []
@@ -198,14 +254,14 @@ task_names = ['2h', '2s', '3', '4_P1', '4_P2', '4_P3', '5']
 task_name = task_names[task_index]
 
 print(f"Running Audio-only task: {task_name}")
-audio_data = np.load(f'/Users/sujithsaisripadam/Downloads/Data/Audio/training_data_{task_name}.npy', allow_pickle=True)
+audio_data = np.load(f'/rds/user/sss77/hpc-work/New/LSTM/Data/Audio/training_data_{task_name}.npy', allow_pickle=True)
 if task_name in ['3', '5']:
-    labels = np.load('/rds/user/sss77/hpc-work/New/MLModels/Data/values_for3,5.npy')
+    labels = np.load('/rds/user/sss77/hpc-work/New/LSTM/Data/values_for3,5.npy')
 else:
-    labels = np.load('/rds/user/sss77/hpc-work/New/MLModels/Data/labels.npy')
+    labels = np.load('/rds/user/sss77/hpc-work/New/LSTM/Data/labels.npy')
 labels = labels.astype(float)
 
-model_dir = f'/Users/sujithsaisripadam/Downloads/Audio/task_{task_name}'
+model_dir = f'/rds/user/sss77/hpc-work/New/LSTM/Audio/task_{task_name}'
 plot_dir = f'{model_dir}/Plots_{task_name}'
 os.makedirs(plot_dir, exist_ok=True)
 os.makedirs(model_dir, exist_ok=True)
@@ -258,6 +314,15 @@ if len(study.trials) > 0:
 print("num trails", num_trials)
 
 study.optimize(lambda trial: objective(trial, task_name, audio_data, labels, plot_dir, model_dir), n_trials=num_trials)
+
+#=============================================================================
+output_dir = "/rds/user/sss77/hpc-work/New/LSTM/"
+os.makedirs(output_dir, exist_ok=True)  # Ensures the directory exists
+output_path = os.path.join(output_dir, "Audio_completed.txt")
+
+with open(output_path, "a") as f:
+    f.write(f"{task_name}\n")
+#=============================================================================
 
 print(f"Best trial for task {task_name}:")
 print(f"MAE: {study.best_value:.4f}")

@@ -1,10 +1,5 @@
 import numpy as np
 import os
-import tensorflow as tf
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, LSTM, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import LeaveOneOut
 from sklearn.metrics import mean_absolute_error, mean_squared_error
@@ -14,6 +9,9 @@ import pandas as pd
 import optuna
 import sys
 import signal
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 results = {}
 best_mse_global = float('inf')
@@ -113,14 +111,23 @@ def plot_subjectwise_losses(all_train_losses, all_val_losses, n_subjects, trial_
     plt.savefig(f"{plot_dir}/subjectwise_loss/trial_{trial_num}_subjectwise_val_loss.png")
     plt.close()
 
-def build_video_model(video_shape, lstm_units, dropout_rate):
-    video_input = Input(shape=video_shape)
-    video_lstm = LSTM(lstm_units, activation='tanh')(video_input)
-    dropout = Dropout(dropout_rate)(video_lstm)
-    output = Dense(1)(dropout)
-    return Model(inputs=video_input, outputs=output)
+def build_video_model(input_dim, lstm_units, dropout_rate):
+    class VideoLSTM(nn.Module):
+        def __init__(self, input_dim, lstm_units, dropout_rate):
+            super().__init__()
+            self.lstm = nn.LSTM(input_dim, lstm_units, batch_first=True)
+            self.dropout = nn.Dropout(dropout_rate)
+            self.fc = nn.Linear(lstm_units, 1)
+        def forward(self, x):
+            out, _ = self.lstm(x)
+            out = out[:, -1, :]
+            out = self.dropout(out)
+            out = self.fc(out)
+            return out
+    return VideoLSTM(input_dim, lstm_units, dropout_rate)
 
 def objective(trial, task_name, video_data, labels, plot_dir, model_dir):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     max_video_length = max(len(seq) for seq in video_data)
     video_data = pad_sequence(video_data, max_video_length)
     video_scaler = StandardScaler()
@@ -132,15 +139,20 @@ def objective(trial, task_name, video_data, labels, plot_dir, model_dir):
     lstm_units = trial.suggest_int('lstm_units', 32, 128)
     dropout_rate = trial.suggest_float('dropout', 0.1, 0.5)
     learning_rate = trial.suggest_float('lr', 1e-5, 1e-3, log=True)
+    optimizer_name = trial.suggest_categorical('optimizer', ['adam', 'adamw', 'sgd', 'rmsprop'])
+    num_epochs = 20
+    batch_size = 16
     for test_index in range(n_subjects):
-        print(f"subj : {n_subjects}")
         X_test_video = video_data[test_index:test_index+1]
         y_test = labels[test_index:test_index+1]
         train_val_ids = [i for i in range(n_subjects) if i != test_index]
         best_mae_val = float('inf')
-        best_weights = None
+        best_state = None
         best_train_losses = []
         best_val_losses = []
+        best_weights = None
+        best_train_losses_final = []
+        best_val_losses_final = []
         for val_index in train_val_ids:
             train_ids = [i for i in train_val_ids if i != val_index]
             X_train_video = video_data[train_ids]
@@ -149,33 +161,77 @@ def objective(trial, task_name, video_data, labels, plot_dir, model_dir):
             y_val = labels[val_index:val_index+1]
             video_scaler.fit(X_train_video.reshape(-1, X_train_video.shape[-1]))
             label_scaler.fit(y_train.reshape(-1, 1))
-            X_train_video = video_scaler.transform(X_train_video.reshape(-1, X_train_video.shape[-1])).reshape(X_train_video.shape)
-            X_val_video = video_scaler.transform(X_val_video.reshape(-1, X_val_video.shape[-1])).reshape(X_val_video.shape)
+            X_train_video_scaled = video_scaler.transform(X_train_video.reshape(-1, X_train_video.shape[-1])).reshape(X_train_video.shape)
+            X_val_video_scaled = video_scaler.transform(X_val_video.reshape(-1, X_val_video.shape[-1])).reshape(X_val_video.shape)
             y_train_scaled = label_scaler.transform(y_train.reshape(-1, 1))
             y_val_scaled = label_scaler.transform(y_val.reshape(-1, 1))
-            model = build_video_model((X_train_video.shape[1], X_train_video.shape[2]), lstm_units, dropout_rate)
-            model.compile(optimizer=Adam(learning_rate), loss='mse')
-            early_stop = EarlyStopping(patience=3, restore_best_weights=True)
-            history = model.fit(X_train_video, y_train_scaled, epochs=20, batch_size=16, verbose=0,
-                      validation_data=(X_val_video, y_val_scaled), callbacks=[early_stop])
-            y_val_pred_scaled = model.predict(X_val_video)
-            y_val_pred = label_scaler.inverse_transform(y_val_pred_scaled)
-            mae_val = mean_absolute_error(y_val, y_val_pred)
-            if mae_val < best_mae_val:
-                best_mae_val = mae_val
-                best_weights = model.get_weights()
-                best_train_losses = history.history['loss'] if 'loss' in history.history else []
-                best_val_losses = history.history['val_loss'] if 'val_loss' in history.history else []
-        if best_weights is not None:
-            model = build_video_model((X_test_video.shape[1], X_test_video.shape[2]), lstm_units, dropout_rate)
-            model.set_weights(best_weights)
-            X_test_video = video_scaler.transform(X_test_video.reshape(-1, X_test_video.shape[-1])).reshape(X_test_video.shape)
-            y_test_pred_scaled = model.predict(X_test_video)
+            X_train_tensor = torch.tensor(X_train_video_scaled, dtype=torch.float32).to(device)
+            X_val_tensor = torch.tensor(X_val_video_scaled, dtype=torch.float32).to(device)
+            y_train_tensor = torch.tensor(y_train_scaled, dtype=torch.float32).to(device)
+            y_val_tensor = torch.tensor(y_val_scaled, dtype=torch.float32).to(device)
+            model = build_video_model(X_train_tensor.shape[2], lstm_units, dropout_rate).to(device)
+            optimizer = None
+            if optimizer_name == 'adam':
+                optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+            elif optimizer_name == 'adamw':
+                optimizer = optim.AdamW(model.parameters(), lr=learning_rate)
+            elif optimizer_name == 'sgd':
+                optimizer = optim.SGD(model.parameters(), lr=learning_rate)
+            elif optimizer_name == 'rmsprop':
+                optimizer = optim.RMSprop(model.parameters(), lr=learning_rate)
+            else:
+                raise ValueError(f"Unknown optimizer: {optimizer_name}")
+            criterion = nn.SmoothL1Loss()
+            train_losses = []
+            val_losses = []
+            best_val = float('inf')
+            patience = 3
+            patience_counter = 0
+            for epoch in range(num_epochs):
+                model.train()
+                optimizer.zero_grad()
+                output = model(X_train_tensor)
+                loss = criterion(output, y_train_tensor)
+                loss.backward()
+                optimizer.step()
+                train_losses.append(loss.item())
+                model.eval()
+                with torch.no_grad():
+                    val_output = model(X_val_tensor)
+                    val_loss = criterion(val_output, y_val_tensor)
+                    val_losses.append(val_loss.item())
+                    val_pred = label_scaler.inverse_transform(val_output.cpu().numpy())
+                    val_true = label_scaler.inverse_transform(y_val_tensor.cpu().numpy())
+                    mae_val = mean_absolute_error(val_true, val_pred)
+                if mae_val < best_val:
+                    best_val = mae_val
+                    best_state = model.state_dict()
+                    best_train_losses = train_losses.copy()
+                    best_val_losses = val_losses.copy()
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                if patience_counter >= patience:
+                    break
+            if best_val < best_mae_val:
+                best_mae_val = best_val
+                best_weights = best_state
+                best_train_losses_final = best_train_losses
+                best_val_losses_final = best_val_losses
+        if best_mae_val < float('inf') and best_weights is not None:
+            model = build_video_model(X_test_video.shape[2], lstm_units, dropout_rate).to(device)
+            model.load_state_dict(best_weights)
+            model.eval()
+            X_test_video_scaled = video_scaler.transform(X_test_video.reshape(-1, X_test_video.shape[-1])).reshape(X_test_video.shape)
+            X_test_tensor = torch.tensor(X_test_video_scaled, dtype=torch.float32).to(device)
+            with torch.no_grad():
+                y_test_pred_scaled = model(X_test_tensor).cpu().numpy()
             y_test_pred = label_scaler.inverse_transform(y_test_pred_scaled)
             y_true_all.append(y_test[0])
             y_pred_all.append(y_test_pred.ravel()[0])
-            all_train_losses[test_index] = best_train_losses
-            all_val_losses[test_index] = best_val_losses
+            all_train_losses[test_index] = best_train_losses_final
+            all_val_losses[test_index] = best_val_losses_final
+            torch.save(best_weights, os.path.join(model_dir, f'model_subject_{test_index}.pt'))
         else:
             all_train_losses[test_index] = []
             all_val_losses[test_index] = []
@@ -194,27 +250,17 @@ task_names = ['2h', '2s', '3', '4_P1', '4_P2', '4_P3', '5']
 task_name = task_names[task_index]
 
 print(f"Running Video-only task: {task_name}")
-video_data = np.load(f'/Users/sujithsaisripadam/Downloads/Data/Video/training_data_{task_name}.npy', allow_pickle=True)
+video_data = np.load(f'/rds/user/sss77/hpc-work/New/LSTM/Data/Video/training_data_{task_name}.npy', allow_pickle=True)
 if task_name in ['3', '5']:
-    labels = np.load('/rds/user/sss77/hpc-work/New/MLModels/Data/values_for3,5.npy')
+    labels = np.load('/rds/user/sss77/hpc-work/New/LSTM/Data/values_for3,5.npy')
 else:
-    labels = np.load('/rds/user/sss77/hpc-work/New/MLModels/Data/labels.npy')
+    labels = np.load('/rds/user/sss77/hpc-work/New/LSTM/Data/labels.npy')
 labels = labels.astype(float)
 
-model_dir = f'/Users/sujithsaisripadam/Downloads/Video/task_{task_name}'
+model_dir = f'/rds/user/sss77/hpc-work/New/LSTM/Video/task_{task_name}'
 plot_dir = f'{model_dir}/Plots_{task_name}'
 os.makedirs(plot_dir, exist_ok=True)
 os.makedirs(model_dir, exist_ok=True)
-
-# TensorFlow GPU check
-try:
-    physical_devices = tf.config.list_physical_devices('GPU')
-    if len(physical_devices) > 0:
-        print(f"TensorFlow is using GPU: {physical_devices}")
-    else:
-        print("TensorFlow is using CPU (no GPU found)")
-except Exception as e:
-    print(f"Could not check GPU status: {e}")
 
 # Create extra directories
 os.makedirs(f"{plot_dir}/loss_plots/", exist_ok=True)
@@ -254,7 +300,14 @@ if len(study.trials) > 0:
 print("num trails", num_trials)
 
 study.optimize(lambda trial: objective(trial, task_name, video_data, labels, plot_dir, model_dir), n_trials=num_trials)
+#=============================================================================
+output_dir = "/rds/user/sss77/hpc-work/New/LSTM/"
+os.makedirs(output_dir, exist_ok=True)  # Ensures the directory exists
+output_path = os.path.join(output_dir, "video_completed.txt")
 
+with open(output_path, "a") as f:
+    f.write(f"{task_name}\n")
+#=============================================================================
 print(f"Best trial for task {task_name}:")
 print(f"MAE: {study.best_value:.4f}")
 print(f"Params: {study.best_trial.params}")
