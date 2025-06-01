@@ -16,26 +16,28 @@ import random
 import signal
 
 # Task setup
+# Task setup
 num_trials = 20
-task_index = int(sys.argv[1])
-#task_index = 1
+#task_index = int(sys.argv[1])
+task_index = 1
 task_names = ['2h', '2s', '3', '4_P1', '4_P2', '4_P3', '5']
 task_name = task_names[task_index]
 
 # Data loading
-video_data = np.load(f'/rds/user/sss77/hpc-work/New/MLModels/Data/Video/training_data_combined_{task_name}.npy')
+audio_data = np.load(f'/rds/user/sss77/hpc-work/New/MLModels/Data/Audio/training_data_combined_{task_name}.npy')
 if task_name in ['3', '5']:
     labels = np.load('/rds/user/sss77/hpc-work/New/MLModels/Data/values_for3,5.npy')
     print(f"task is 3 or 5: {task_name}")
 else:
     labels = np.load('/rds/user/sss77/hpc-work/New/MLModels/Data/labels.npy')
 labels = labels.astype(float)
-X_combined = video_data
+
+X_combined = audio_data
 n_subjects = len(labels)
 
 # Directories
-model_dir = f'/rds/user/sss77/hpc-work/New/NN/video/'
-plot_dir = f'/rds/user/sss77/hpc-work/New/NN/video/plots_{task_name}/'
+model_dir = f'/rds/user/sss77/hpc-work/New/NN/audio/'
+plot_dir = f'/rds/user/sss77/hpc-work/New/NN/audio/plots_{task_name}/'
 os.makedirs(model_dir, exist_ok=True)
 os.makedirs(plot_dir + 'models/', exist_ok=True)
 os.makedirs(plot_dir + 'csv/', exist_ok=True)
@@ -55,7 +57,7 @@ def handler(signum, frame):
 signal.signal(signal.SIGTERM, handler)
 signal.signal(signal.SIGINT, handler)
 
-#pruner = optuna.pruners.MedianPruner(n_startup_trials=3, n_warmup_steps=0, interval_steps=10)
+#pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=10, interval_steps=1)
 study = optuna.create_study(
     direction="minimize",
     study_name=f"ef_{task_name}",
@@ -76,6 +78,7 @@ if len(study.trials) > 0:
     if last_finished is not None:
         # Print the next trial number to indicate continuation
         print(f"Previous run found, continuing from trial: {last_finished+1}")
+
         num_trials = max(0, num_trials - (last_finished + 1))
 print("num trails",num_trials)
 
@@ -380,32 +383,27 @@ def objective(trial):
 # Run Optuna optimization
 study.optimize(objective, num_trials)
 
-
 #=============================================================================
 output_dir = "/rds/user/sss77/hpc-work/New/NN/"
 os.makedirs(output_dir, exist_ok=True)  # Ensures the directory exists
-output_path = os.path.join(output_dir, "video_completed.txt")
+output_path = os.path.join(output_dir, "audio_completed.txt")
 
 with open(output_path, "a") as f:
     f.write(f"{task_name}\n")
 #=============================================================================
 
-
-# Get best results
 best_trial_number = study.best_trial.number
-best_mae, all_test_preds, all_test_true = results[best_trial_number]
+best_mse, all_test_preds, all_test_true = results[best_trial_number]
 
-# Calculate final metrics
 rmse = np.sqrt(mean_squared_error(all_test_true, all_test_preds))
 mae = mean_absolute_error(all_test_true, all_test_preds)
 pcc, _ = pearsonr(all_test_true, all_test_preds)
 ccc_score = ccc(all_test_true, all_test_preds)
 
-# Print final results
 print(f"\nFinal Test Results for {task_name}:")
 print(f"RMSE: {rmse:.4f}\nMAE:  {mae:.4f}\nPCC:  {pcc:.4f}\nCCC:  {ccc_score:.4f}")
 
-# Save final results visualization
+# Save results and plot
 plt.figure(figsize=(8, 6))
 plt.scatter(all_test_true, all_test_preds, alpha=0.7)
 plt.plot([min(all_test_true), max(all_test_true)],
@@ -417,11 +415,9 @@ plt.grid(True)
 plt.savefig(f"{plot_dir}/true_vs_pred_{task_name}.png")
 plt.close()
 
-# Save results to CSV
 df = pd.DataFrame({'True': all_test_true, 'Predicted': all_test_preds})
 df.to_csv(os.path.join(model_dir, f'true_vs_pred_{task_name}.csv'), index=False)
 
-# Save final results to file
 with open(os.path.join(model_dir, f'results_nn_{task_name}.txt'), 'a') as f:
     f.write(f"\nTask: {task_name}\n")
     f.write(f"Best MAE (Optuna): {study.best_value:.4f}\n")

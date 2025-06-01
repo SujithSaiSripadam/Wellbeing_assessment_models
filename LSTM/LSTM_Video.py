@@ -13,6 +13,7 @@ from scipy.stats import pearsonr
 import pandas as pd
 import optuna
 import sys
+import signal
 
 best_mae_global = float('inf')
 
@@ -151,8 +152,54 @@ plot_dir = f'{model_dir}/Plots_{task_name}'
 os.makedirs(plot_dir, exist_ok=True)
 os.makedirs(model_dir, exist_ok=True)
 
-study = optuna.create_study(direction='minimize')
-study.optimize(lambda trial: objective(trial, task_name, video_data, labels, plot_dir, model_dir), n_trials=30)
+# TensorFlow GPU check
+try:
+    physical_devices = tf.config.list_physical_devices('GPU')
+    if len(physical_devices) > 0:
+        print(f"TensorFlow is using GPU: {physical_devices}")
+    else:
+        print("TensorFlow is using CPU (no GPU found)")
+except Exception as e:
+    print(f"Could not check GPU status: {e}")
+
+# Create extra directories
+os.makedirs(f"{plot_dir}/loss_plots/", exist_ok=True)
+os.makedirs(f"{plot_dir}/subjectwise_loss/", exist_ok=True)
+os.makedirs(model_dir + '/optuna/', exist_ok=True)
+
+# Optuna study setup
+study_path = f"{model_dir}/optuna/optuna_study_{task_name}.db"
+storage_str = f"sqlite:///{study_path}"
+
+def handler(signum, frame):
+    print("Termination signal received. Exiting gracefully...")
+    raise KeyboardInterrupt
+
+signal.signal(signal.SIGTERM, handler)
+signal.signal(signal.SIGINT, handler)
+
+num_trials = 30  # Default, can be changed
+
+study = optuna.create_study(
+    direction="minimize",
+    study_name=f"video_{task_name}",
+    storage=storage_str,
+    load_if_exists=True,
+)
+
+print(f"lenoftrails :  {len(study.trials)}")
+
+if len(study.trials) > 0:
+    last_finished = max(
+        [t.number for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE],
+        default=None
+    )
+    if last_finished is not None:
+        print(f"Previous run found, continuing from trial: {last_finished+1}")
+        num_trials = max(0, num_trials - (last_finished + 1))
+print("num trails", num_trials)
+
+study.optimize(lambda trial: objective(trial, task_name, video_data, labels, plot_dir, model_dir), n_trials=num_trials)
 
 print(f"Best trial for task {task_name}:")
 print(f"MAE: {study.best_value:.4f}")

@@ -13,8 +13,10 @@ from scipy.stats import pearsonr
 import pandas as pd
 import optuna
 import sys
+import signal
 
-best_mae_global = float('inf')
+results = {}
+best_mse_global = float('inf')
 
 def pad_sequence(sequences, max_length):
     return np.array([np.pad(seq, ((0, max_length - len(seq)), (0, 0)), mode='constant') for seq in sequences])
@@ -29,32 +31,37 @@ def ccc(y_true, y_pred):
     cov = np.mean((y_true - mean_true) * (y_pred - mean_pred))
     return (2 * cov) / (var_true + var_pred + (mean_true - mean_pred)**2 + 1e-8)
 
-def save_intermediate(trial_num, mae, preds, trues, trial_params, plot_dir, model_dir, task_name):
-    global best_mae_global
-    if mae < best_mae_global:
-        best_mae_global = mae
-        rmse = np.sqrt(mean_squared_error(trues, preds))
-        pcc, _ = pearsonr(trues, preds)
-        ccc_score = ccc(trues, preds)
+def save_intermediate(trial_num, mae, preds, trues, trial_params, task_name, plot_dir, model_dir):
+    global best_mse_global
+    rmse = np.sqrt(mean_squared_error(trues, preds))
+    if rmse < best_mse_global:
+        best_mse_global = rmse
+    pcc, _ = pearsonr(trues, preds)
+    ccc_score = ccc(trues, preds)
+    loss_std = np.std(np.abs(np.array(trues) - np.array(preds)))
 
-        plt.figure(figsize=(8, 6))
-        plt.scatter(trues, preds, alpha=0.7)
-        plt.plot([min(trues), max(trues)], [min(trues), max(trues)], 'r--')
-        plt.xlabel('True')
-        plt.ylabel('Predicted')
-        plt.title(f'Trial {trial_num} - {task_name}')
-        plt.grid(True)
-        os.makedirs(f"{plot_dir}/csv", exist_ok=True)
-        plt.savefig(f"{plot_dir}/trial_{trial_num}_scatter.png")
-        plt.close()
+    # Plot scatter
+    plt.figure(figsize=(8, 6))
+    plt.scatter(trues, preds, alpha=0.7)
+    plt.plot([min(trues), max(trues)], [min(trues), max(trues)], 'r--')
+    plt.xlabel('True')
+    plt.ylabel('Predicted')
+    plt.title(f'Trial {trial_num} - {task_name}')
+    plt.grid(True)
+    plt.savefig(f"{plot_dir}/trial_{trial_num}_scatter.png")
+    plt.close()
 
-        pd.DataFrame({'True': trues, 'Predicted': preds}).to_csv(
-            f"{plot_dir}/csv/trial_{trial_num}_true_vs_pred.csv", index=False)
+    # Save CSV
+    pd.DataFrame({'True': trues, 'Predicted': preds}).to_csv(
+        f"{plot_dir}/csv/trial_{trial_num}_true_vs_pred.csv", index=False)
 
-        with open(os.path.join(model_dir, f'intermediate_best_results_{task_name}.txt'), 'a') as f:
-            f.write(f"\nTrial {trial_num}\n")
-            f.write(f"MAE:  {mae:.4f}\nRMSE: {rmse:.4f}\nPCC:  {pcc:.4f}\nCCC:  {ccc_score:.4f}\n")
-            f.write(f"Params: {trial_params}\n" + '-' * 40 + '\n')
+    # Write results
+    with open(os.path.join(model_dir, f'intermediate_best_results_{task_name}.txt'), 'a') as f:
+        f.write(f"\nTrial {trial_num}\n")
+        f.write(f"MAE:  {mae:.4f}\nRMSE: {rmse:.4f}\nPCC:  {pcc:.4f}\nCCC:  {ccc_score:.4f}\n")
+        f.write(f"Loss STD: {loss_std:.4f}\n")
+        f.write(f"Best RMSE_Global: {best_mse_global:.4f}\n")
+        f.write(f"Params: {trial_params}\n" + '-' * 40 + '\n')
 
 def build_audio_model(audio_shape, lstm_units, dropout_rate):
     audio_input = Input(shape=audio_shape)
@@ -66,73 +73,124 @@ def build_audio_model(audio_shape, lstm_units, dropout_rate):
 def objective(trial, task_name, audio_data, labels, plot_dir, model_dir):
     max_audio_length = max(len(seq) for seq in audio_data)
     audio_data = pad_sequence(audio_data, max_audio_length)
-
     audio_scaler = StandardScaler()
     label_scaler = StandardScaler()
-
     n_subjects = len(audio_data)
     y_true_all, y_pred_all = [], []
-
+    all_train_losses = [[] for _ in range(n_subjects)]
+    all_val_losses = [[] for _ in range(n_subjects)]
     lstm_units = trial.suggest_int('lstm_units', 32, 128)
     dropout_rate = trial.suggest_float('dropout', 0.1, 0.5)
     learning_rate = trial.suggest_float('lr', 1e-5, 1e-3, log=True)
-
     for test_index in range(n_subjects):
         print(f"subj : {n_subjects}")
         X_test_audio = audio_data[test_index:test_index+1]
         y_test = labels[test_index:test_index+1]
-
         train_val_ids = [i for i in range(n_subjects) if i != test_index]
         best_mae_val = float('inf')
         best_weights = None
-
+        best_train_losses = []
+        best_val_losses = []
         for val_index in train_val_ids:
             train_ids = [i for i in train_val_ids if i != val_index]
-
             X_train_audio = audio_data[train_ids]
             X_val_audio = audio_data[val_index:val_index+1]
             y_train = labels[train_ids]
             y_val = labels[val_index:val_index+1]
-
             audio_scaler.fit(X_train_audio.reshape(-1, X_train_audio.shape[-1]))
             label_scaler.fit(y_train.reshape(-1, 1))
-
             X_train_audio = audio_scaler.transform(X_train_audio.reshape(-1, X_train_audio.shape[-1])).reshape(X_train_audio.shape)
             X_val_audio = audio_scaler.transform(X_val_audio.reshape(-1, X_val_audio.shape[-1])).reshape(X_val_audio.shape)
-
             y_train_scaled = label_scaler.transform(y_train.reshape(-1, 1))
             y_val_scaled = label_scaler.transform(y_val.reshape(-1, 1))
-
             model = build_audio_model((X_train_audio.shape[1], X_train_audio.shape[2]), lstm_units, dropout_rate)
-
             model.compile(optimizer=Adam(learning_rate), loss='mse')
             early_stop = EarlyStopping(patience=3, restore_best_weights=True)
-
-            model.fit(X_train_audio, y_train_scaled, epochs=20, batch_size=16, verbose=0,
+            history = model.fit(X_train_audio, y_train_scaled, epochs=20, batch_size=16, verbose=0,
                       validation_data=(X_val_audio, y_val_scaled), callbacks=[early_stop])
-
             y_val_pred_scaled = model.predict(X_val_audio)
             y_val_pred = label_scaler.inverse_transform(y_val_pred_scaled)
             mae_val = mean_absolute_error(y_val, y_val_pred)
-
             if mae_val < best_mae_val:
                 best_mae_val = mae_val
                 best_weights = model.get_weights()
-
-        model.set_weights(best_weights)
-        X_test_audio = audio_scaler.transform(X_test_audio.reshape(-1, X_test_audio.shape[-1])).reshape(X_test_audio.shape)
-        y_test_pred_scaled = model.predict(X_test_audio)
-        y_test_pred = label_scaler.inverse_transform(y_test_pred_scaled)
-
-        y_true_all.append(y_test[0])
-        y_pred_all.append(y_test_pred.ravel()[0])
-
+                best_train_losses = history.history['loss'] if 'loss' in history.history else []
+                best_val_losses = history.history['val_loss'] if 'val_loss' in history.history else []
+        if best_weights is not None:
+            model = build_audio_model((X_test_audio.shape[1], X_test_audio.shape[2]), lstm_units, dropout_rate)
+            model.set_weights(best_weights)
+            X_test_audio = audio_scaler.transform(X_test_audio.reshape(-1, X_test_audio.shape[-1])).reshape(X_test_audio.shape)
+            y_test_pred_scaled = model.predict(X_test_audio)
+            y_test_pred = label_scaler.inverse_transform(y_test_pred_scaled)
+            y_true_all.append(y_test[0])
+            y_pred_all.append(y_test_pred.ravel()[0])
+            all_train_losses[test_index] = best_train_losses
+            all_val_losses[test_index] = best_val_losses
+        else:
+            all_train_losses[test_index] = []
+            all_val_losses[test_index] = []
     y_true_all = np.array(y_true_all)
     y_pred_all = np.array(y_pred_all)
-    mae = mean_absolute_error(y_true_all, y_pred_all)
+    min_len = min(len(l) for l in all_train_losses if len(l) > 0)
+    avg_train_losses = np.mean([l[:min_len] for l in all_train_losses if len(l) > 0], axis=0)
+    avg_val_losses = np.mean([l[:min_len] for l in all_val_losses if len(l) > 0], axis=0)
+    plot_average_losses(avg_train_losses, avg_val_losses, trial.number, plot_dir, min_len)
+    plot_subjectwise_losses(all_train_losses, all_val_losses, n_subjects, trial.number, plot_dir)
+    save_intermediate(trial.number, mean_absolute_error(y_true_all, y_pred_all), y_pred_all, y_true_all, trial.params, task_name, plot_dir, model_dir)
+    return mean_absolute_error(y_true_all, y_pred_all)
 
-    save_intermediate(trial.number, mae, y_pred_all, y_true_all, trial.params, plot_dir, model_dir, task_name)
-    return mae
+def plot_average_losses(avg_train_losses, avg_val_losses, trial_num, plot_dir, min_len):
+    plt.figure(figsize=(10, 5))
+    plt.plot(range(min_len), avg_train_losses, label='Avg Training Loss', color='blue')
+    plt.title('Average Training Loss Across Subjects')
+    plt.xlabel('Epoch')
+    plt.ylabel('Training Loss')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"{plot_dir}/loss_plots/trial_{trial_num}_avg_train_loss.png")
+    plt.close()
+    plt.figure(figsize=(10, 5))
+    plt.plot(range(min_len), avg_val_losses, label='Avg Validation Loss', color='orange')
+    plt.title('Average Validation Loss Across Subjects')
+    plt.xlabel('Epoch')
+    plt.ylabel('Validation Loss')
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(f"{plot_dir}/loss_plots/trial_{trial_num}_avg_val_loss.png")
+    plt.close()
+
+def plot_subjectwise_losses(all_train_losses, all_val_losses, n_subjects, trial_num, plot_dir):
+    rows = (n_subjects // 6) + (1 if n_subjects % 6 != 0 else 0)
+    cols = min(n_subjects, 6)
+    fig_train, axs_train = plt.subplots(rows, cols, figsize=(24, 4 * rows))
+    axs_train = np.ravel(axs_train) if rows * cols > 1 else [axs_train]
+    for idx in range(n_subjects):
+        ax = axs_train[idx]
+        ax.plot(all_train_losses[idx], label='Train Loss', color='red')
+        ax.set_title(f"Subject {idx} - Training Loss")
+        ax.set_xlabel("Epochs")
+        ax.set_ylabel("Loss")
+        ax.legend()
+    for i in range(n_subjects, len(axs_train)):
+        fig_train.delaxes(axs_train[i])
+    plt.tight_layout()
+    plt.savefig(f"{plot_dir}/subjectwise_loss/trial_{trial_num}_subjectwise_train_loss.png")
+    plt.close()
+    fig_val, axs_val = plt.subplots(rows, cols, figsize=(24, 4 * rows))
+    axs_val = np.ravel(axs_val) if rows * cols > 1 else [axs_val]
+    for idx in range(n_subjects):
+        ax = axs_val[idx]
+        if len(all_val_losses[idx]) > 0:
+            ax.plot(all_val_losses[idx], label='Val Loss', color='green')
+            ax.set_title(f"Subject {idx} - Validation Loss")
+            ax.set_xlabel("Epochs")
+            ax.set_ylabel("Loss")
+            ax.legend()
+    for i in range(n_subjects, len(axs_val)):
+        fig_val.delaxes(axs_val[i])
+    plt.tight_layout()
+    plt.savefig(f"{plot_dir}/subjectwise_loss/trial_{trial_num}_subjectwise_val_loss.png")
+    plt.close()
 
 # Usage: python script.py <task_index>
 task_index = int(sys.argv[1])
@@ -152,8 +210,54 @@ plot_dir = f'{model_dir}/Plots_{task_name}'
 os.makedirs(plot_dir, exist_ok=True)
 os.makedirs(model_dir, exist_ok=True)
 
-study = optuna.create_study(direction='minimize')
-study.optimize(lambda trial: objective(trial, task_name, audio_data, labels, plot_dir, model_dir), n_trials=30)
+# TensorFlow GPU check
+try:
+    physical_devices = tf.config.experimental.list_physical_devices('GPU')
+    if len(physical_devices) > 0:
+        print(f"TensorFlow is using GPU: {physical_devices}")
+    else:
+        print("TensorFlow is using CPU (no GPU found)")
+except Exception as e:
+    print(f"Could not check GPU status: {e}")
+
+# Create extra directories
+os.makedirs(f"{plot_dir}/loss_plots/", exist_ok=True)
+os.makedirs(f"{plot_dir}/subjectwise_loss/", exist_ok=True)
+os.makedirs(model_dir + '/optuna/', exist_ok=True)
+
+# Optuna study setup
+study_path = f"{model_dir}/optuna/optuna_study_{task_name}.db"
+storage_str = f"sqlite:///{study_path}"
+
+def handler(signum, frame):
+    print("Termination signal received. Exiting gracefully...")
+    raise KeyboardInterrupt
+
+signal.signal(signal.SIGTERM, handler)
+signal.signal(signal.SIGINT, handler)
+
+num_trials = 30  # Default, can be changed
+
+study = optuna.create_study(
+    direction="minimize",
+    study_name=f"audio_{task_name}",
+    storage=storage_str,
+    load_if_exists=True,
+)
+
+print(f"lenoftrails :  {len(study.trials)}")
+
+if len(study.trials) > 0:
+    last_finished = max(
+        [t.number for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE],
+        default=None
+    )
+    if last_finished is not None:
+        print(f"Previous run found, continuing from trial: {last_finished+1}")
+        num_trials = max(0, num_trials - (last_finished + 1))
+print("num trails", num_trials)
+
+study.optimize(lambda trial: objective(trial, task_name, audio_data, labels, plot_dir, model_dir), n_trials=num_trials)
 
 print(f"Best trial for task {task_name}:")
 print(f"MAE: {study.best_value:.4f}")
