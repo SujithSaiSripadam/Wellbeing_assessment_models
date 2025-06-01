@@ -278,6 +278,7 @@ except Exception as e:
 
 # Create extra directories
 os.makedirs(f"{plot_dir}/loss_plots/", exist_ok=True)
+os.makedirs(f"{plot_dir}/csv/", exist_ok=True)
 os.makedirs(f"{plot_dir}/subjectwise_loss/", exist_ok=True)
 os.makedirs(model_dir + '/optuna/', exist_ok=True)
 
