@@ -17,6 +17,17 @@ import signal
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import random
+
+SEED = 42  
+
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+sampler = optuna.samplers.TPESampler(seed=SEED)
 
 best_mae_global = float('inf')
 results = {}
@@ -310,6 +321,7 @@ study = optuna.create_study(
     study_name=f"lf_{task_name}",
     storage=storage_str,
     load_if_exists=True,
+    sampler=sampler
 )
 
 print(f"lenoftrails :  {len(study.trials)}")
